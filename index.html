@@ -183,10 +183,71 @@
     text-align: center;
   }
 
+  /* ── 노래방 시작/종료 토글 버튼 (헤더 우측) ── */
+  #karaoke-toggle {
+    flex-shrink: 0;
+    margin-left: auto;
+    align-self: center;
+    border: 1px solid var(--panel-border);
+    background: var(--bg-void);
+    color: var(--text-main);
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    font-size: clamp(13px, 1.4vw, 16px);
+    letter-spacing: 0.02em;
+    padding: clamp(10px, 1.4vh, 14px) clamp(18px, 2.4vw, 28px);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, opacity 0.2s ease;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  #karaoke-toggle .dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    margin-right: 8px;
+    vertical-align: middle;
+    background: var(--text-faint);
+    transition: background 0.2s ease, box-shadow 0.2s ease;
+  }
+  /* 대기 상태 (시작 가능) */
+  #karaoke-toggle[data-state="idle"] {
+    background: var(--spotlight);
+    border-color: var(--spotlight);
+    color: #1a1206;
+  }
+  #karaoke-toggle[data-state="idle"] .dot {
+    background: #1a1206;
+    box-shadow: none;
+  }
+  /* 실행 중 (종료 가능) */
+  #karaoke-toggle[data-state="running"] {
+    background: var(--bg-void);
+    border-color: var(--accent-rose);
+    color: var(--text-main);
+  }
+  #karaoke-toggle[data-state="running"] .dot {
+    background: var(--accent-rose);
+    box-shadow: 0 0 8px var(--accent-rose);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  /* 전환 중 (커맨드 대기) — 잠시 비활성 */
+  #karaoke-toggle[data-state="pending"] {
+    opacity: 0.55;
+    pointer-events: none;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
   @media (max-width: 560px) {
-    header { gap: 14px; padding: 14px 18px; }
+    header { gap: 14px; padding: 14px 18px; flex-wrap: wrap; }
     #song-title { white-space: normal; }
     #song-sub { white-space: normal; }
+    #karaoke-toggle { margin-left: 0; width: 100%; margin-top: 4px; }
   }
 </style>
 </head>
@@ -202,6 +263,9 @@
     <h1 id="song-title">노래를 기다리는 중…</h1>
     <p id="song-sub"></p>
   </div>
+  <button id="karaoke-toggle" data-state="idle" type="button">
+    <span class="dot"></span><span id="karaoke-toggle-label">노래방 시작</span>
+  </button>
 </header>
 
 <main>
@@ -224,10 +288,14 @@
   //   기대하는 엔드포인트 계약:
   //   GET  {BACKEND_URL}/genie-lyrics?artist=&title=  → {"lyrics": "..." | null}
   //   GET  {BACKEND_URL}/now-playing                   → {"artist":"","album":"","title":""} | null
+  //   GET  {BACKEND_URL}/karaoke-active                 → {"active": true|false}
+  //   POST {BACKEND_URL}/karaoke-start                  → 노래방 시작(프록시가 ST 스위치 ON)
+  //   POST {BACKEND_URL}/karaoke-stop                   → 노래방 종료(프록시가 ST 스위치 OFF)
   // ─────────────────────────────────────────────
   const CONFIG = {
     BACKEND_URL: 'https://madoka74teraoke.pagekite.me',
-    POLL_INTERVAL_MS: 2500,
+    POLL_INTERVAL_MS: 2500,   // 실행 중: now-playing 폴링 주기 (= 하트비트)
+    STATUS_INTERVAL_MS: 4000, // 상태 동기화: 프록시 active 확인 주기 (타임아웃/외부 종료 감지)
   };
 
   const headerEl   = document.getElementById('header');
@@ -375,13 +443,14 @@
   // 예: index.html?artist=아이유&title=좋은날&album=REAL
   // ─────────────────────────────────────────────
   const qs = new URLSearchParams(location.search);
-  if (qs.get('artist') && qs.get('title')) {
+  const TEST_MODE = !!(qs.get('artist') && qs.get('title'));
+  if (TEST_MODE) {
     window.loadSong(qs.get('artist'), qs.get('album') || '', qs.get('title'));
   }
 
   // ─────────────────────────────────────────────
-  // /now-playing 폴링 — BACKEND_URL 설정 시에만 동작.
-  // 곡이 바뀐 게 감지되면 자동으로 loadSong() 호출.
+  // /now-playing 폴링 — "실행 중"일 때만 동작하며, 이 요청 자체가 프록시의
+  // 하트비트를 갱신한다(3분 무신호 시 프록시가 자동 종료). 곡이 바뀌면 loadSong().
   // ─────────────────────────────────────────────
   let lastSongKey = null;
 
@@ -390,7 +459,10 @@
       const res = await fetch(`${CONFIG.BACKEND_URL}/now-playing`);
       if (!res.ok) return;
       const data = await res.json();
-      if (!data || !data.artist || !data.title) return;
+      if (!data || !data.artist || !data.title) {
+        // 곡 정보가 비었으면(프록시가 종료로 clear한 경우 등) 대기 화면 유지
+        return;
+      }
 
       const key = `${data.artist}|${data.album || ''}|${data.title}`;
       if (key !== lastSongKey) {
@@ -402,9 +474,133 @@
     }
   }
 
-  if (CONFIG.BACKEND_URL) {
+  // ─────────────────────────────────────────────
+  // 노래방 상태 관리 (진실 원천 = 프록시)
+  //   웹 로컬 상태 running은 UI 표현일 뿐, 실제 판단은 프록시 /karaoke-active를 따른다.
+  //   - "시작" 버튼 → POST /karaoke-start → 프록시 active=true + ST 스위치 ON
+  //   - "종료" 버튼 → POST /karaoke-stop  → 프록시 active=false + ST 스위치 OFF
+  //   - 타임아웃/외부(ST앱) 종료 → 프록시 active=false → 상태폴링이 감지해 UI 자동 복귀
+  //   - 외부에서 시작(ST앱) → 프록시 active=true → 상태폴링이 감지해 UI 자동 실행
+  // ─────────────────────────────────────────────
+  const toggleBtn   = document.getElementById('karaoke-toggle');
+  const toggleLabel = document.getElementById('karaoke-toggle-label');
+
+  let running = false;       // 웹 로컬 UI 상태
+  let nowPlayingTimer = null;
+
+  function setToggleState(state) {
+    // state: 'idle' | 'running' | 'pending'
+    toggleBtn.setAttribute('data-state', state);
+    if (state === 'idle')        toggleLabel.textContent = '노래방 시작';
+    else if (state === 'running') toggleLabel.textContent = '노래방 종료';
+    else                          toggleLabel.textContent = '전환 중…';
+  }
+
+  function resetToWaiting() {
+    // UI를 완전한 대기 상태로 되돌림
+    lastSongKey = null;
+    headerEl.classList.remove('has-song');
+    titleEl.textContent = '노래를 기다리는 중…';
+    subEl.textContent = '';
+    setArt(null);
+    lyricsEl.style.display = 'none';
+    emptyStateEl.style.display = 'block';
+    emptyStateEl.innerHTML =
+      '<div class="icon">🎤</div><h2>대기 중</h2>' +
+      '<p>노래방 시작을 누르면 재생 중인 곡의 가사가 표시됩니다.</p>';
+  }
+
+  function startNowPlayingLoop() {
+    if (nowPlayingTimer) return;
     pollNowPlaying();
-    setInterval(pollNowPlaying, CONFIG.POLL_INTERVAL_MS);
+    nowPlayingTimer = setInterval(pollNowPlaying, CONFIG.POLL_INTERVAL_MS);
+  }
+
+  function stopNowPlayingLoop() {
+    if (nowPlayingTimer) {
+      clearInterval(nowPlayingTimer);
+      nowPlayingTimer = null;
+    }
+  }
+
+  // 웹 로컬 상태를 running/idle로 전환 (UI + 폴링 루프 동기화)
+  function applyRunning(next) {
+    if (next === running) return;
+    running = next;
+    if (running) {
+      setToggleState('running');
+      startNowPlayingLoop();
+    } else {
+      setToggleState('idle');
+      stopNowPlayingLoop();
+      resetToWaiting();
+    }
+  }
+
+  async function requestStart() {
+    setToggleState('pending');
+    try {
+      const res = await fetch(`${CONFIG.BACKEND_URL}/karaoke-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: 'web' }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      applyRunning(true);
+    } catch (e) {
+      console.warn('[karaoke] 시작 실패:', e);
+      // 실패 시 프록시 실제 상태로 되돌림
+      setToggleState(running ? 'running' : 'idle');
+      alert('노래방 시작에 실패했어요. 잠시 후 다시 시도해주세요.');
+    }
+  }
+
+  async function requestStop() {
+    setToggleState('pending');
+    try {
+      const res = await fetch(`${CONFIG.BACKEND_URL}/karaoke-stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: 'web' }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      applyRunning(false);
+    } catch (e) {
+      console.warn('[karaoke] 종료 실패:', e);
+      setToggleState(running ? 'running' : 'idle');
+      alert('노래방 종료에 실패했어요. 잠시 후 다시 시도해주세요.');
+    }
+  }
+
+  toggleBtn.addEventListener('click', function () {
+    if (toggleBtn.getAttribute('data-state') === 'pending') return;
+    if (running) requestStop();
+    else         requestStart();
+  });
+
+  // 상태 동기화 폴링: 프록시 active를 주기적으로 확인해 웹 UI를 프록시에 맞춘다.
+  // (타임아웃 자동종료, ST앱에서의 on/off 등 웹 외부 변화를 반영)
+  async function syncKaraokeState() {
+    try {
+      const res = await fetch(`${CONFIG.BACKEND_URL}/karaoke-active`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const active = !!(data && data.active);
+      // pending 중이면(사용자 방금 누름) 덮어쓰지 않음 — 요청 완료가 상태를 확정
+      if (toggleBtn.getAttribute('data-state') === 'pending') return;
+      applyRunning(active);
+    } catch (e) {
+      // 프록시 무응답 시엔 현재 UI 유지 (섣불리 상태 바꾸지 않음)
+      console.warn('[karaoke] 상태 동기화 실패:', e);
+    }
+  }
+
+  // 테스트용 URL 파라미터로 진입한 경우엔 상태머신 초기화를 건너뛰고 표시만 유지.
+  // 정상 모드에서는 대기 화면으로 시작 후, 프록시 상태를 폴링해 UI를 동기화.
+  if (CONFIG.BACKEND_URL && !TEST_MODE) {
+    resetToWaiting();
+    syncKaraokeState();
+    setInterval(syncKaraokeState, CONFIG.STATUS_INTERVAL_MS);
   }
 })();
 </script>
