@@ -219,6 +219,17 @@
 
 <script>
 (function () {
+  // ─────────────────────────────────────────────
+  // 백엔드(Mac Mini 프록시) 설정 — 확정되면 BACKEND_URL만 채우면 됨
+  //   기대하는 엔드포인트 계약:
+  //   GET  {BACKEND_URL}/genie-lyrics?artist=&title=  → {"lyrics": "..." | null}
+  //   GET  {BACKEND_URL}/now-playing                   → {"artist":"","album":"","title":""} | null
+  // ─────────────────────────────────────────────
+  const CONFIG = {
+    BACKEND_URL: 'https://madoka74teraoke.pagekite.me',
+    POLL_INTERVAL_MS: 2500,
+  };
+
   const headerEl   = document.getElementById('header');
   const artWrap     = document.getElementById('art-wrap');
   const artImg       = document.getElementById('art-img');
@@ -273,94 +284,25 @@
   }
 
   // ─────────────────────────────────────────────
-  // 지니뮤직 (비공식, 개인 테스트용) — SmartThings 드라이버 프로젝트에서
-  // 실제 HTML로 검증 완료된 것과 동일한 파싱 로직을 JS로 포팅.
-  // ⚠️ 그때는 Python 서버(CORS 무관)에서 호출했지만, 여기는 브라우저 JS가
-  //    직접 호출 — genie.co.kr이 CORS를 막으면 조용히 실패하고 다음
-  //    소스로 넘어감(예상되는 정상 동작, 에러 아님).
+  // 지니뮤직 — genie.co.kr을 브라우저에서 직접 호출하면 CORS로 막힘(실측
+  // 확인: TypeError: Failed to fetch). Mac Mini 백엔드가 대신 조회해서
+  // 넘겨주는 방식으로 전환. BACKEND_URL 미설정 시 조용히 스킵하고
+  // lrclib/lyrics.ovh로 넘어감.
   // ─────────────────────────────────────────────
-  function decodeHtmlEntities(str) {
-    const el = document.createElement('textarea');
-    el.innerHTML = str;
-    return el.value;
-  }
-
-  function genieExtractLinkText(htmlBlock, classWord) {
-    const pattern = new RegExp(
-      '<a[^>]*class=["\'][^"\']*\\b' + classWord + '\\b[^"\']*["\'][^>]*>([\\s\\S]*?)</a>'
-    );
-    const m = pattern.exec(htmlBlock);
-    if (!m) return null;
-    let inner = m[1];
-    inner = inner.replace(/<span[^>]*class=["'][^"']*\bicon\b[^"']*["'][^>]*>[\s\S]*?<\/span>/g, '');
-    inner = inner.replace(/<[^>]+>/g, ' ');
-    inner = decodeHtmlEntities(inner);
-    inner = inner.replace(/\s+/g, ' ').trim();
-    return inner || null;
-  }
-
-  async function genieSearch(artist, title) {
-    const query = `${artist} ${title}`.trim();
-    const url = `https://www.genie.co.kr/search/searchMain?query=${encodeURIComponent(query)}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`genie 검색 HTTP ${res.status}`);
-    const body = await res.text();
-
-    const candidates = [];
-    const rowsSplit = body.split(/(?=<tr\s+class=["']list["'])/).slice(1);
-    for (const rowFull of rowsSplit) {
-      const end = rowFull.indexOf('</tr>');
-      const rowHtml = end !== -1 ? rowFull.slice(0, end + 5) : rowFull.slice(0, 4000);
-      const mId = /songid=["'](\d+)["']/.exec(rowHtml);
-      const titleText = genieExtractLinkText(rowHtml, 'title');
-      const artistName = genieExtractLinkText(rowHtml, 'artist');
-      if (mId && titleText) {
-        candidates.push({ songId: mId[1], title: titleText, artist: artistName || '' });
-      }
-    }
-    return candidates;
-  }
-
-  function geniePickBest(candidates, targetArtist) {
-    const ta = targetArtist.toLowerCase().trim();
-    for (const c of candidates) {
-      if (ta && c.artist.toLowerCase().includes(ta)) return c;
-    }
-    return candidates[0] || null;
-  }
-
-  async function genieGetLyricsRaw(songId) {
-    const url = `https://dn.genie.co.kr/app/purchase/get_msl.asp?path=a&songid=${songId}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`genie 가사 HTTP ${res.status}`);
-    const raw = await res.text();
-    const openIdx = raw.indexOf('(');
-    const closeIdx = raw.lastIndexOf(')');
-    if (openIdx === -1 || closeIdx === -1) throw new Error('genie 가사 응답 형식 이상');
-    const data = JSON.parse(raw.slice(openIdx + 1, closeIdx));
-    if (!data || typeof data !== 'object' || Object.keys(data).length === 0) return null;
-    return data; // { "밀리초": "가사줄", ... }
-  }
-
   async function fetchLyricsFromGenie(artist, title) {
-    const candidates = await genieSearch(artist, title);
-    if (candidates.length === 0) return null;
-    const best = geniePickBest(candidates, artist);
-    if (!best) return null;
-    const data = await genieGetLyricsRaw(best.songId);
-    if (!data) return null;
-    // 실시간 동기화 필요 없음 → 타임스탬프 순 정렬 후 텍스트만 이어붙임
-    return Object.entries(data)
-      .sort((a, b) => parseInt(a[0], 10) - parseInt(b[0], 10))
-      .map(([, text]) => text)
-      .join('\n');
+    if (!CONFIG.BACKEND_URL) return null;
+    const url = `${CONFIG.BACKEND_URL}/genie-lyrics?artist=${encodeURIComponent(artist)}&title=${encodeURIComponent(title)}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.lyrics || null;
   }
 
   async function fetchLyrics(artist, title, album) {
     try {
       const fromGenie = await fetchLyricsFromGenie(artist, title);
       if (fromGenie) return fromGenie;
-    } catch (e) { console.warn('[lyrics] genie 실패(CORS일 가능성):', e); }
+    } catch (e) { console.warn('[lyrics] genie(백엔드) 실패:', e); }
 
     try {
       const fromLrclib = await fetchLyricsFromLrclib(artist, title, album);
@@ -435,6 +377,34 @@
   const qs = new URLSearchParams(location.search);
   if (qs.get('artist') && qs.get('title')) {
     window.loadSong(qs.get('artist'), qs.get('album') || '', qs.get('title'));
+  }
+
+  // ─────────────────────────────────────────────
+  // /now-playing 폴링 — BACKEND_URL 설정 시에만 동작.
+  // 곡이 바뀐 게 감지되면 자동으로 loadSong() 호출.
+  // ─────────────────────────────────────────────
+  let lastSongKey = null;
+
+  async function pollNowPlaying() {
+    try {
+      const res = await fetch(`${CONFIG.BACKEND_URL}/now-playing`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data || !data.artist || !data.title) return;
+
+      const key = `${data.artist}|${data.album || ''}|${data.title}`;
+      if (key !== lastSongKey) {
+        lastSongKey = key;
+        window.loadSong(data.artist, data.album || '', data.title);
+      }
+    } catch (e) {
+      console.warn('[now-playing] 폴링 실패:', e);
+    }
+  }
+
+  if (CONFIG.BACKEND_URL) {
+    pollNowPlaying();
+    setInterval(pollNowPlaying, CONFIG.POLL_INTERVAL_MS);
   }
 })();
 </script>
