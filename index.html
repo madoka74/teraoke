@@ -288,14 +288,12 @@
   //   기대하는 엔드포인트 계약:
   //   GET  {BACKEND_URL}/genie-lyrics?artist=&title=  → {"lyrics": "..." | null}
   //   GET  {BACKEND_URL}/now-playing                   → {"artist":"","album":"","title":""} | null
-  //   GET  {BACKEND_URL}/karaoke-active                 → {"active": true|false}
   //   POST {BACKEND_URL}/karaoke-start                  → 노래방 시작(프록시가 ST 스위치 ON)
   //   POST {BACKEND_URL}/karaoke-stop                   → 노래방 종료(프록시가 ST 스위치 OFF)
   // ─────────────────────────────────────────────
   const CONFIG = {
     BACKEND_URL: 'https://madoka74teraoke.pagekite.me',
-    POLL_INTERVAL_MS: 2500,   // 실행 중: now-playing 폴링 주기 (= 하트비트)
-    STATUS_INTERVAL_MS: 4000, // 상태 동기화: 프록시 active 확인 주기 (타임아웃/외부 종료 감지)
+    POLL_INTERVAL_MS: 2500,   // 실행 중에만: now-playing 폴링 주기 (= 하트비트)
   };
 
   const headerEl   = document.getElementById('header');
@@ -449,38 +447,55 @@
   }
 
   // ─────────────────────────────────────────────
-  // /now-playing 폴링 — "실행 중"일 때만 동작하며, 이 요청 자체가 프록시의
-  // 하트비트를 갱신한다(3분 무신호 시 프록시가 자동 종료). 곡이 바뀌면 loadSong().
+  // /now-playing 폴링 — "실행 중"일 때만 동작한다. 이 요청 자체가 프록시의
+  // 하트비트를 갱신한다(3분 무신호 시 프록시가 자동 종료).
+  //   - 곡이 바뀌면 loadSong()
+  //   - 곡 정보가 비어 있으면(프록시가 타임아웃/외부 종료로 clear한 상태) → UI를 대기로 복귀.
+  //     별도의 상태 동기화 폴링 없이, 이 실행-중 폴링 하나로 비동기 종료를 감지한다.
+  //   - emptyCount로 몇 번 연속 비었을 때만 종료로 판단(시작 직후 곡 정보가 아직
+  //     안 올라온 과도기를 종료로 오인하지 않도록).
   // ─────────────────────────────────────────────
   let lastSongKey = null;
+  let emptyPolls = 0;
+  const EMPTY_POLLS_TO_STOP = 3; // 연속 N회 곡 없음 → 프록시 종료로 간주
 
   async function pollNowPlaying() {
     try {
       const res = await fetch(`${CONFIG.BACKEND_URL}/now-playing`);
       if (!res.ok) return;
       const data = await res.json();
+
       if (!data || !data.artist || !data.title) {
-        // 곡 정보가 비었으면(프록시가 종료로 clear한 경우 등) 대기 화면 유지
+        // 곡 정보 없음. 시작 직후 과도기일 수 있으므로 몇 번 참았다가,
+        // 계속 비어 있으면 프록시가 종료된 것으로 보고 대기 상태로 복귀.
+        emptyPolls += 1;
+        if (running && emptyPolls >= EMPTY_POLLS_TO_STOP) {
+          console.warn('[now-playing] 곡 정보 연속 없음 — 프록시 종료로 판단, 대기 복귀');
+          applyRunning(false);
+        }
         return;
       }
 
+      emptyPolls = 0;
       const key = `${data.artist}|${data.album || ''}|${data.title}`;
       if (key !== lastSongKey) {
         lastSongKey = key;
         window.loadSong(data.artist, data.album || '', data.title);
       }
     } catch (e) {
+      // 네트워크 실패는 종료로 간주하지 않음(일시적일 수 있음). UI 유지.
       console.warn('[now-playing] 폴링 실패:', e);
     }
   }
 
   // ─────────────────────────────────────────────
   // 노래방 상태 관리 (진실 원천 = 프록시)
-  //   웹 로컬 상태 running은 UI 표현일 뿐, 실제 판단은 프록시 /karaoke-active를 따른다.
-  //   - "시작" 버튼 → POST /karaoke-start → 프록시 active=true + ST 스위치 ON
-  //   - "종료" 버튼 → POST /karaoke-stop  → 프록시 active=false + ST 스위치 OFF
-  //   - 타임아웃/외부(ST앱) 종료 → 프록시 active=false → 상태폴링이 감지해 UI 자동 복귀
-  //   - 외부에서 시작(ST앱) → 프록시 active=true → 상태폴링이 감지해 UI 자동 실행
+  //   시작/종료는 웹페이지 버튼으로만 이루어진다.
+  //   - "시작" 버튼 → POST /karaoke-start → 프록시 active=true + ST 스위치 ON → 실행 중 폴링 시작
+  //   - "종료" 버튼 → POST /karaoke-stop  → 프록시 active=false + ST 스위치 OFF → 폴링 정지
+  //   - 비동기 종료(3분 하트비트 타임아웃 등)는 프록시가 전담하며, 곡 정보를 비운다.
+  //     웹은 실행 중 now-playing 폴링에서 "곡 없음"을 감지해 대기로 복귀한다.
+  //   ※ 대기 상태에서는 어떤 폴링도 하지 않는다(터널 연결/rate 소모 방지).
   // ─────────────────────────────────────────────
   const toggleBtn   = document.getElementById('karaoke-toggle');
   const toggleLabel = document.getElementById('karaoke-toggle-label');
@@ -512,6 +527,7 @@
 
   function startNowPlayingLoop() {
     if (nowPlayingTimer) return;
+    emptyPolls = 0;
     pollNowPlaying();
     nowPlayingTimer = setInterval(pollNowPlaying, CONFIG.POLL_INTERVAL_MS);
   }
@@ -578,29 +594,11 @@
     else         requestStart();
   });
 
-  // 상태 동기화 폴링: 프록시 active를 주기적으로 확인해 웹 UI를 프록시에 맞춘다.
-  // (타임아웃 자동종료, ST앱에서의 on/off 등 웹 외부 변화를 반영)
-  async function syncKaraokeState() {
-    try {
-      const res = await fetch(`${CONFIG.BACKEND_URL}/karaoke-active`);
-      if (!res.ok) return;
-      const data = await res.json();
-      const active = !!(data && data.active);
-      // pending 중이면(사용자 방금 누름) 덮어쓰지 않음 — 요청 완료가 상태를 확정
-      if (toggleBtn.getAttribute('data-state') === 'pending') return;
-      applyRunning(active);
-    } catch (e) {
-      // 프록시 무응답 시엔 현재 UI 유지 (섣불리 상태 바꾸지 않음)
-      console.warn('[karaoke] 상태 동기화 실패:', e);
-    }
-  }
-
-  // 테스트용 URL 파라미터로 진입한 경우엔 상태머신 초기화를 건너뛰고 표시만 유지.
-  // 정상 모드에서는 대기 화면으로 시작 후, 프록시 상태를 폴링해 UI를 동기화.
-  if (CONFIG.BACKEND_URL && !TEST_MODE) {
+  // 초기 진입: 대기 화면으로 시작. 대기 상태에서는 아무 폴링도 하지 않는다.
+  // (프록시로의 연결 시도 자체를 없애 터널 rate/quota 소모를 막는다.)
+  // 시작 버튼을 누르는 순간부터만 프록시와 통신한다.
+  if (!TEST_MODE) {
     resetToWaiting();
-    syncKaraokeState();
-    setInterval(syncKaraokeState, CONFIG.STATUS_INTERVAL_MS);
   }
 })();
 </script>
