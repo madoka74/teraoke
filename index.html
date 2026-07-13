@@ -145,6 +145,27 @@
     text-align: center;
   }
 
+  /* 줄 단위 싱크 모드: 각 가사 줄이 .lyric-line div로 렌더링됨 */
+  .lyric-line {
+    opacity: 0.4;
+    transition: opacity 0.35s ease, transform 0.35s ease, color 0.35s ease;
+    padding: 3px 0;
+    white-space: pre-wrap;
+  }
+  .lyric-line.current {
+    opacity: 1;
+    color: var(--spotlight);
+    font-weight: 600;
+    transform: scale(1.05);
+  }
+  .lyric-line.passed {
+    opacity: 0.6;
+  }
+  /* 앵커(재생 위치) 미수신 상태: 하이라이트 불가하니 전체를 밝게 표시 */
+  #lyrics.nosync .lyric-line {
+    opacity: 0.95;
+  }
+
   #empty-state {
     margin: auto;
     text-align: center;
@@ -319,15 +340,22 @@
   }
 
   // ─────────────────────────────────────────────
-  // 가사: LRCLIB 우선(동기화 있으면 텍스트만 추출) → lyrics.ovh 폴백
-  // 실시간 동기화는 필요 없으므로 전체 텍스트만 사용
+  // 가사: 모든 소스가 {lines: [{t(ms), text}] | null, plain: string | null} 통일 형식 반환.
+  //   lines가 있으면 줄 단위 실시간 하이라이트, 없으면 전체 텍스트 표시(기존 방식).
+  //   우선순위: 지니(싱크) → LRCLIB(싱크/텍스트) → lyrics.ovh(텍스트)
   // ─────────────────────────────────────────────
-  function syncedToPlain(syncedLyrics) {
-    return syncedLyrics
-      .split('\n')
-      .map(line => line.replace(/^\[\d+:\d+\.\d+\]\s*/, ''))
-      .filter(line => line.trim() !== '')
-      .join('\n');
+
+  // LRC 형식 "[mm:ss.xx] 가사" → [{t, text}] 파싱
+  function parseLrcToLines(syncedLyrics) {
+    const lines = [];
+    for (const raw of syncedLyrics.split('\n')) {
+      const m = raw.match(/^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$/);
+      if (!m) continue;
+      const t = Math.round((parseInt(m[1], 10) * 60 + parseFloat(m[2])) * 1000);
+      const text = m[3].trim();
+      if (text !== '') lines.push({ t, text });
+    }
+    return lines.length > 0 ? lines : null;
   }
 
   async function fetchLyricsFromLrclib(artist, title, album) {
@@ -336,8 +364,11 @@
     const res = await fetch(`https://lrclib.net/api/get?${params.toString()}`);
     if (!res.ok) return null;
     const data = await res.json();
-    if (data.syncedLyrics) return syncedToPlain(data.syncedLyrics);
-    if (data.plainLyrics) return data.plainLyrics;
+    if (data.syncedLyrics) {
+      const lines = parseLrcToLines(data.syncedLyrics);
+      if (lines) return { lines, plain: lines.map(l => l.text).join('\n') };
+    }
+    if (data.plainLyrics) return { lines: null, plain: data.plainLyrics };
     return null;
   }
 
@@ -346,14 +377,12 @@
     const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
-    return data.lyrics || null;
+    return data.lyrics ? { lines: null, plain: data.lyrics } : null;
   }
 
   // ─────────────────────────────────────────────
-  // 지니뮤직 — genie.co.kr을 브라우저에서 직접 호출하면 CORS로 막힘(실측
-  // 확인: TypeError: Failed to fetch). Mac Mini 백엔드가 대신 조회해서
-  // 넘겨주는 방식으로 전환. BACKEND_URL 미설정 시 조용히 스킵하고
-  // lrclib/lyrics.ovh로 넘어감.
+  // 지니뮤직 — genie.co.kr 직접 호출은 CORS로 막혀 백엔드가 대신 조회.
+  // 백엔드가 타임스탬프 보존된 lines([{t,text}])와 전체 텍스트(lyrics)를 함께 반환.
   // ─────────────────────────────────────────────
   async function fetchLyricsFromGenie(artist, title) {
     if (!CONFIG.BACKEND_URL) return null;
@@ -361,7 +390,9 @@
     const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
-    return data.lyrics || null;
+    if (data.lines && data.lines.length > 0) return { lines: data.lines, plain: data.lyrics || '' };
+    if (data.lyrics) return { lines: null, plain: data.lyrics };
+    return null;
   }
 
   async function fetchLyrics(artist, title, album) {
@@ -384,6 +415,72 @@
   }
 
   // ─────────────────────────────────────────────
+  // 재생 위치 트래커 (앵커 + 로컬 시계)
+  //   드라이버가 10초마다 프록시에 elapsed를 보내고, 웹은 now-playing 폴링(2.5초)으로
+  //   앵커(posMs, 받은 시각)를 갱신. 그 사이는 브라우저 로컬 시계로 진행을 추정.
+  //   현재위치 ≈ posMs + (지금 - anchorAt), Paused/Stopped면 시계 정지.
+  //   줄 단위 하이라이트용이라 ±수 초 오차는 허용 범위.
+  // ─────────────────────────────────────────────
+  const tracker = {
+    posMs: 0,        // 앵커 시점의 재생 위치(ms)
+    anchorAt: 0,     // 앵커를 받은 브라우저 시각 (performance.now())
+    playing: false,  // Playing 상태에서만 시계 진행
+    hasAnchor: false,
+  };
+  let syncedLines = null;      // 현재 곡의 [{t, text}] (없으면 plain 모드)
+  let lineEls = [];            // 렌더링된 .lyric-line 요소들
+  let currentLineIdx = -1;
+  let highlightTimer = null;
+
+  function setAnchor(elapsedMs, ageMs, status) {
+    tracker.posMs = (elapsedMs || 0) + (ageMs || 0);
+    tracker.anchorAt = performance.now();
+    tracker.playing = status === 'Playing';
+    tracker.hasAnchor = true;
+  }
+
+  function estimatePosMs() {
+    if (!tracker.hasAnchor) return -1;
+    if (!tracker.playing) return tracker.posMs;
+    return tracker.posMs + (performance.now() - tracker.anchorAt);
+  }
+
+  function updateHighlight() {
+    if (!syncedLines || lineEls.length === 0) return;
+    const pos = estimatePosMs();
+    if (pos < 0) { lyricsEl.classList.add('nosync'); return; }
+    lyricsEl.classList.remove('nosync');
+
+    // 현재 줄 = t <= pos 인 마지막 줄
+    let idx = -1;
+    for (let i = 0; i < syncedLines.length; i++) {
+      if (syncedLines[i].t <= pos) idx = i;
+      else break;
+    }
+    if (idx === currentLineIdx) return;
+
+    if (currentLineIdx >= 0 && lineEls[currentLineIdx]) {
+      lineEls[currentLineIdx].classList.remove('current');
+      lineEls[currentLineIdx].classList.add('passed');
+    }
+    currentLineIdx = idx;
+    if (idx >= 0 && lineEls[idx]) {
+      lineEls[idx].classList.remove('passed');
+      lineEls[idx].classList.add('current');
+      lineEls[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+
+  function startHighlightLoop() {
+    if (highlightTimer) return;
+    highlightTimer = setInterval(updateHighlight, 500);
+  }
+
+  function stopHighlightLoop() {
+    if (highlightTimer) { clearInterval(highlightTimer); highlightTimer = null; }
+  }
+
+  // ─────────────────────────────────────────────
   // 렌더링
   // ─────────────────────────────────────────────
   function setArt(url) {
@@ -396,17 +493,40 @@
     artImg.src = url;
   }
 
-  function setLyrics(text) {
-    if (text) {
-      lyricsEl.textContent = text;
-      lyricsEl.style.display = 'block';
-      emptyStateEl.style.display = 'none';
-    } else {
+  // result: {lines, plain} | null
+  function setLyrics(result) {
+    syncedLines = null;
+    lineEls = [];
+    currentLineIdx = -1;
+    lyricsEl.textContent = '';
+
+    if (!result || (!result.lines && !result.plain)) {
       lyricsEl.style.display = 'none';
       emptyStateEl.style.display = 'block';
       emptyStateEl.innerHTML =
         '<div class="icon">🎵</div><h2>가사를 찾지 못했어요</h2><p>이 곡은 가사 데이터가 없는 것 같아요.</p>';
+      return;
     }
+
+    if (result.lines && result.lines.length > 0) {
+      // 싱크 모드: 줄별 div 렌더링 (textContent 사용 — HTML 주입 방지)
+      syncedLines = result.lines;
+      lyricsEl.classList.add('nosync'); // 앵커 수신 시 updateHighlight가 해제
+      for (const line of syncedLines) {
+        const div = document.createElement('div');
+        div.className = 'lyric-line';
+        div.textContent = line.text;
+        lyricsEl.appendChild(div);
+        lineEls.push(div);
+      }
+    } else {
+      // 폴백: 전체 텍스트 (하이라이트 없음)
+      lyricsEl.textContent = result.plain;
+    }
+
+    lyricsEl.style.display = 'block';
+    emptyStateEl.style.display = 'none';
+    updateHighlight(); // 즉시 1회 반영 (앵커가 이미 있으면 현재 줄로 점프)
   }
 
   function setLoading() {
@@ -417,8 +537,7 @@
   }
 
   // ─────────────────────────────────────────────
-  // 메인 진입점 — 외부에서 곡 정보를 받으면 이 함수 하나만 호출하면 됨.
-  // (POST 수신 방식은 추후 확정 — 그 브릿지가 완성되면 여기로 연결)
+  // 메인 진입점 — 곡이 바뀌면 호출됨
   // ─────────────────────────────────────────────
   window.loadSong = async function loadSong(artist, album, title) {
     headerEl.classList.add('has-song');
@@ -427,13 +546,13 @@
     setArt(null);
     setLoading();
 
-    const [artworkUrl, lyricsText] = await Promise.all([
+    const [artworkUrl, lyricsResult] = await Promise.all([
       fetchArtwork(artist, title).catch(err => { console.warn('[art]', err); return null; }),
       fetchLyrics(artist, title, album),
     ]);
 
     setArt(artworkUrl);
-    setLyrics(lyricsText);
+    setLyrics(lyricsResult);
   };
 
   // ─────────────────────────────────────────────
@@ -477,6 +596,10 @@
       }
 
       emptyPolls = 0;
+
+      // 매 폴링마다 재생 위치 앵커 갱신 (드라이버가 10초마다 넣어주는 elapsed 반영)
+      setAnchor(data.elapsed_ms || 0, data.age_ms || 0, data.playback_status || '');
+
       const key = `${data.artist}|${data.album || ''}|${data.title}`;
       if (key !== lastSongKey) {
         lastSongKey = key;
@@ -528,8 +651,10 @@
   function startNowPlayingLoop() {
     if (nowPlayingTimer) return;
     emptyPolls = 0;
+    tracker.hasAnchor = false; // 이전 세션 앵커 무효화
     pollNowPlaying();
     nowPlayingTimer = setInterval(pollNowPlaying, CONFIG.POLL_INTERVAL_MS);
+    startHighlightLoop();
   }
 
   function stopNowPlayingLoop() {
@@ -537,6 +662,8 @@
       clearInterval(nowPlayingTimer);
       nowPlayingTimer = null;
     }
+    stopHighlightLoop();
+    tracker.hasAnchor = false;
   }
 
   // 웹 로컬 상태를 running/idle로 전환 (UI + 폴링 루프 동기화)
