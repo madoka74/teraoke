@@ -315,7 +315,7 @@
   const CONFIG = {
     BACKEND_URL: 'https://teraoke.serveousercontent.com',
     POLL_INTERVAL_MS: 2500,   // 실행 중에만: now-playing 폴링 주기 (= 하트비트)
-    LYRIC_OFFSET_MS: 1500,   // 가사 하이라이트 선행 보정(ms). 늦으면 ↑, 빠르면 ↓
+    LYRIC_OFFSET_MS: 1500,    // 가사 하이라이트 선행 보정(ms). 늦으면 ↑, 빠르면 ↓
   };
 
   const headerEl   = document.getElementById('header');
@@ -427,17 +427,48 @@
     anchorAt: 0,     // 앵커를 받은 브라우저 시각 (performance.now())
     playing: false,  // Playing 상태에서만 시계 진행
     hasAnchor: false,
+    lastRawElapsed: null, // 프록시가 준 마지막 elapsed_ms 원본값(변화 감지용)
   };
   let syncedLines = null;      // 현재 곡의 [{t, text}] (없으면 plain 모드)
   let lineEls = [];            // 렌더링된 .lyric-line 요소들
   let currentLineIdx = -1;
   let highlightTimer = null;
 
+  // 앵커는 elapsed 값이 "실제로 바뀌었을 때만" 다시 잡는다.
+  //   - 매 폴링(2.5초)마다 재앵커하면, 드라이버 POST(10초)로 age가 0으로 리셋될 때
+  //     위치가 뒤로 튕겨 톱니처럼 왕복한다(줄 건너뜀 + 누적 지연의 원인).
+  //   - Tesla의 elapsed가 갱신 안 되는 경우에도 로컬 시계로 자유 진행하므로 안전.
   function setAnchor(elapsedMs, ageMs, status) {
-    tracker.posMs = (elapsedMs || 0) + (ageMs || 0);
-    tracker.anchorAt = performance.now();
-    tracker.playing = status === 'Playing';
-    tracker.hasAnchor = true;
+    const raw = elapsedMs || 0;
+    const nowPlaying = status === 'Playing';
+
+    // 일시정지 → 재생 재개: 현재 추정 위치를 유지한 채 시계만 다시 흐르게 함
+    if (nowPlaying && tracker.hasAnchor && !tracker.playing) {
+      tracker.anchorAt = performance.now();
+    }
+    // 재생 → 일시정지: 지금까지 흐른 만큼을 확정해 두고 시계 정지
+    if (!nowPlaying && tracker.hasAnchor && tracker.playing) {
+      tracker.posMs = tracker.posMs + (performance.now() - tracker.anchorAt);
+      tracker.anchorAt = performance.now();
+    }
+    tracker.playing = nowPlaying;
+
+    // elapsed 원본값이 바뀌었을 때(또는 최초)만 하드 재앵커
+    if (!tracker.hasAnchor || raw !== tracker.lastRawElapsed) {
+      tracker.lastRawElapsed = raw;
+      tracker.posMs = raw + (ageMs || 0);
+      tracker.anchorAt = performance.now();
+      tracker.hasAnchor = true;
+    }
+  }
+
+  // 곡이 바뀌면 앵커를 완전히 초기화(이전 곡 위치가 새 곡에 새는 것 방지)
+  function resetAnchor() {
+    tracker.posMs = 0;
+    tracker.anchorAt = 0;
+    tracker.playing = false;
+    tracker.hasAnchor = false;
+    tracker.lastRawElapsed = null;
   }
 
   function estimatePosMs() {
@@ -604,6 +635,8 @@
       const key = `${data.artist}|${data.album || ''}|${data.title}`;
       if (key !== lastSongKey) {
         lastSongKey = key;
+        resetAnchor();  // 이전 곡의 위치가 새 곡으로 새지 않도록 초기화
+        setAnchor(data.elapsed_ms || 0, data.age_ms || 0, data.playback_status || '');
         window.loadSong(data.artist, data.album || '', data.title);
       }
     } catch (e) {
