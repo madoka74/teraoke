@@ -427,53 +427,33 @@
     anchorAt: 0,     // 앵커를 받은 브라우저 시각 (performance.now())
     playing: false,  // Playing 상태에서만 시계 진행
     hasAnchor: false,
-    lastRawElapsed: null, // 프록시가 준 마지막 elapsed_ms 원본값(변화 감지용)
   };
   let syncedLines = null;      // 현재 곡의 [{t, text}] (없으면 plain 모드)
   let lineEls = [];            // 렌더링된 .lyric-line 요소들
   let currentLineIdx = -1;
   let highlightTimer = null;
 
-  // 앵커는 elapsed 값이 "실제로 바뀌었을 때만" 다시 잡는다.
-  //   - 매 폴링(2.5초)마다 재앵커하면, 드라이버 POST(10초)로 age가 0으로 리셋될 때
-  //     위치가 뒤로 튕겨 톱니처럼 왕복한다(줄 건너뜀 + 누적 지연의 원인).
-  //   - Tesla의 elapsed가 갱신 안 되는 경우에도 로컬 시계로 자유 진행하므로 안전.
+  // 매 폴링(2.5초)마다 프록시가 준 최신 위치로 앵커를 갱신한다.
+  //   posMs = elapsed_ms(차량 재생위치) + age_ms(프록시가 그 값을 받은 뒤 흐른 시간)
+  //   폴링 사이의 짧은 구간만 브라우저 시계로 보간한다.
   function setAnchor(elapsedMs, ageMs, status) {
-    const raw = elapsedMs || 0;
-    // 상태값이 비어있거나 모르는 값이면 "재생 중"으로 간주한다.
-    // (status를 안 보내는 버전과 호환 — 'Playing' 일치만 보면 시계가 멈춰버림)
+    tracker.posMs = (elapsedMs || 0) + (ageMs || 0);
+    tracker.anchorAt = performance.now();
+    // 상태값이 비어있거나 모르는 값이면 재생 중으로 간주 (status 미전송 버전 호환)
     const st = String(status || '').toLowerCase();
-    const nowPlaying = !(st === 'paused' || st === 'stopped');
-
-    // 일시정지 → 재생 재개: 현재 추정 위치를 유지한 채 시계만 다시 흐르게 함
-    if (nowPlaying && tracker.hasAnchor && !tracker.playing) {
-      tracker.anchorAt = performance.now();
-    }
-    // 재생 → 일시정지: 지금까지 흐른 만큼을 확정해 두고 시계 정지
-    if (!nowPlaying && tracker.hasAnchor && tracker.playing) {
-      tracker.posMs = tracker.posMs + (performance.now() - tracker.anchorAt);
-      tracker.anchorAt = performance.now();
-    }
-    tracker.playing = nowPlaying;
-
-    // elapsed 원본값이 바뀌었을 때(또는 최초)만 하드 재앵커
-    if (!tracker.hasAnchor || raw !== tracker.lastRawElapsed) {
-      tracker.lastRawElapsed = raw;
-      tracker.posMs = raw + (ageMs || 0);
-      tracker.anchorAt = performance.now();
-      tracker.hasAnchor = true;
-    }
+    tracker.playing = !(st === 'paused' || st === 'stopped');
+    tracker.hasAnchor = true;
   }
 
-  // 곡이 바뀌면 앵커를 완전히 초기화(이전 곡 위치가 새 곡에 새는 것 방지)
+  // 곡이 바뀌면 앵커 초기화 (이전 곡 위치가 새 곡에 새는 것 방지)
   function resetAnchor() {
     tracker.posMs = 0;
     tracker.anchorAt = 0;
     tracker.playing = false;
     tracker.hasAnchor = false;
-    tracker.lastRawElapsed = null;
   }
 
+  // LYRIC_OFFSET_MS 만큼 하이라이트를 앞당긴다(양수 = 더 빨리 넘어감)
   function estimatePosMs() {
     if (!tracker.hasAnchor) return -1;
     if (!tracker.playing) return tracker.posMs + CONFIG.LYRIC_OFFSET_MS;
