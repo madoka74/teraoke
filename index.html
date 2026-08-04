@@ -166,6 +166,74 @@
     opacity: 0.95;
   }
 
+  /* ── 하이라이트 미세조정 바 (재생 중에만 표시) ── */
+  #offset-bar {
+    position: fixed;
+    left: 50%;
+    bottom: clamp(14px, 3vh, 28px);
+    transform: translateX(-50%);
+    display: none;               /* 재생 중에만 flex로 전환 */
+    align-items: center;
+    gap: clamp(8px, 1.4vw, 14px);
+    padding: clamp(8px, 1.2vh, 12px) clamp(12px, 1.8vw, 18px);
+    background: rgba(20, 23, 31, 0.92);
+    border: 1px solid var(--panel-border);
+    border-radius: 999px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+    z-index: 50;
+    backdrop-filter: blur(8px);
+  }
+  #offset-bar.visible { display: flex; }
+
+  #offset-bar button {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+    cursor: pointer;
+    border: 1px solid var(--panel-border);
+    background: var(--bg-void);
+    color: var(--text-main);
+    font-family: 'Inter', -apple-system, sans-serif;
+    font-weight: 700;
+    font-size: clamp(15px, 1.8vw, 19px);
+    line-height: 1;
+    min-width: clamp(46px, 6vw, 60px);
+    padding: clamp(9px, 1.3vh, 13px) 0;
+    border-radius: 999px;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  #offset-bar button:active {
+    background: var(--spotlight);
+    border-color: var(--spotlight);
+    color: #1a1206;
+  }
+  #offset-bar .readout {
+    min-width: clamp(74px, 9vw, 96px);
+    text-align: center;
+    font-size: clamp(13px, 1.5vw, 16px);
+    font-weight: 600;
+    color: var(--spotlight);
+    font-variant-numeric: tabular-nums;
+  }
+  #offset-bar .readout .hint {
+    display: block;
+    font-size: clamp(9px, 1vw, 11px);
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    margin-top: 2px;
+  }
+  #offset-bar .reset {
+    min-width: auto;
+    padding: clamp(9px, 1.3vh, 13px) clamp(10px, 1.4vw, 14px);
+    font-size: clamp(11px, 1.2vw, 13px);
+    font-weight: 600;
+    color: var(--text-dim);
+  }
+
+  /* 조정바가 가사를 가리지 않도록 본문 하단 여백 확보 */
+  main { padding-bottom: clamp(92px, 14vh, 150px); }
+
   #empty-state {
     margin: auto;
     text-align: center;
@@ -302,6 +370,13 @@
   <div id="lyrics" style="display:none;"></div>
 </main>
 
+<div id="offset-bar">
+  <button type="button" id="offset-minus" aria-label="가사 0.5초 늦추기">−0.5s</button>
+  <div class="readout"><span id="offset-value">0.0s</span><span class="hint">가사 위치</span></div>
+  <button type="button" id="offset-plus" aria-label="가사 0.5초 당기기">+0.5s</button>
+  <button type="button" id="offset-reset" class="reset">초기화</button>
+</div>
+
 <script>
 (function () {
   // ─────────────────────────────────────────────
@@ -315,7 +390,7 @@
   const CONFIG = {
     BACKEND_URL: 'https://teraoke.serveousercontent.com',
     POLL_INTERVAL_MS: 2500,   // 실행 중에만: now-playing 폴링 주기 (= 하트비트)
-    LYRIC_OFFSET_MS: 2000,    // 가사 하이라이트 선행 보정(ms). 늦으면 ↑, 빠르면 ↓
+    LYRIC_OFFSET_MS: 1500,    // 가사 하이라이트 선행 보정(ms). 늦으면 ↑, 빠르면 ↓
   };
 
   const headerEl   = document.getElementById('header');
@@ -453,12 +528,55 @@
     tracker.hasAnchor = false;
   }
 
-  // LYRIC_OFFSET_MS 만큼 하이라이트를 앞당긴다(양수 = 더 빨리 넘어감)
+  // 화면 버튼으로 조정하는 수동 오프셋(ms). 곡이 바뀌면 0으로 초기화된다.
+  let manualOffsetMs = 0;
+
+  // 전체 보정 = 기본 오프셋(CONFIG) + 화면에서 조정한 수동 오프셋
+  // 양수 = 하이라이트가 더 빨리(앞서) 넘어감
+  function totalOffsetMs() {
+    return CONFIG.LYRIC_OFFSET_MS + manualOffsetMs;
+  }
+
   function estimatePosMs() {
     if (!tracker.hasAnchor) return -1;
-    if (!tracker.playing) return tracker.posMs + CONFIG.LYRIC_OFFSET_MS;
-    return tracker.posMs + (performance.now() - tracker.anchorAt) + CONFIG.LYRIC_OFFSET_MS;
+    if (!tracker.playing) return tracker.posMs + totalOffsetMs();
+    return tracker.posMs + (performance.now() - tracker.anchorAt) + totalOffsetMs();
   }
+
+  // ─────────────────────────────────────────────
+  // 하이라이트 미세조정 바 — 재생 중에만 노출.
+  //   ±0.5초 단위로 조정하며, 곡이 바뀌면 0으로 초기화된다.
+  // ─────────────────────────────────────────────
+  const offsetBar   = document.getElementById('offset-bar');
+  const offsetValue = document.getElementById('offset-value');
+  const OFFSET_STEP_MS = 500;
+
+  function renderOffsetValue() {
+    const sec = manualOffsetMs / 1000;
+    const sign = sec > 0 ? '+' : '';
+    offsetValue.textContent = `${sign}${sec.toFixed(1)}s`;
+  }
+
+  function adjustOffset(deltaMs) {
+    manualOffsetMs += deltaMs;
+    renderOffsetValue();
+    updateHighlight();   // 즉시 반영
+  }
+
+  // 곡 변경 시 호출 — 조정값 초기화
+  function resetManualOffset() {
+    manualOffsetMs = 0;
+    renderOffsetValue();
+  }
+
+  function showOffsetBar(show) {
+    offsetBar.classList.toggle('visible', !!show);
+  }
+
+  document.getElementById('offset-minus').addEventListener('click', () => adjustOffset(-OFFSET_STEP_MS));
+  document.getElementById('offset-plus').addEventListener('click',  () => adjustOffset(OFFSET_STEP_MS));
+  document.getElementById('offset-reset').addEventListener('click', () => { resetManualOffset(); updateHighlight(); });
+  renderOffsetValue();
 
   function updateHighlight() {
     if (!syncedLines || lineEls.length === 0) return;
@@ -618,7 +736,8 @@
       const key = `${data.artist}|${data.album || ''}|${data.title}`;
       if (key !== lastSongKey) {
         lastSongKey = key;
-        resetAnchor();  // 이전 곡의 위치가 새 곡으로 새지 않도록 초기화
+        resetAnchor();       // 이전 곡의 위치가 새 곡으로 새지 않도록 초기화
+        resetManualOffset(); // 곡이 바뀌면 화면에서 조정한 값도 0으로 초기화
         setAnchor(data.elapsed_ms || 0, data.age_ms || 0, data.playback_status || '');
         window.loadSong(data.artist, data.album || '', data.title);
       }
@@ -690,10 +809,13 @@
     if (running) {
       setToggleState('running');
       startNowPlayingLoop();
+      showOffsetBar(true);
     } else {
       setToggleState('idle');
       stopNowPlayingLoop();
       resetToWaiting();
+      resetManualOffset();
+      showOffsetBar(false);
     }
   }
 
